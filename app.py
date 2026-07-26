@@ -97,7 +97,8 @@ def send_waha_media(chat_id, file_bytes, filename, mimetype, caption=None):
     return waha_post(ep, pl)
 
 def to_chat_id(number):
-    return f"{re.sub(r'[^\d]', '', number)}@c.us"
+    digits_only = re.sub(r'[^\d]', '', number)
+    return f"{digits_only}@c.us"
 
 def from_chat_id(chat_id):
     return re.sub(r"@.*", "", chat_id)
