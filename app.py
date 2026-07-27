@@ -192,7 +192,7 @@ def waha_webhook():
         threading.Thread(target=_handle_wa_message, args=(payload,), daemon=True).start()
     elif event == "message.reaction":
         threading.Thread(target=_handle_wa_reaction, args=(payload,), daemon=True).start()
-    elif event == "message.ack":
+    elif event in ("message.ack", "message_ack", "ack"):
         threading.Thread(target=_handle_wa_ack, args=(payload,), daemon=True).start()
     return jsonify({"ok": True})
 
@@ -255,11 +255,16 @@ def _handle_wa_ack(payload):
         msg_id = payload.get("id", "")
         ack = payload.get("ack", 0)
         info = msg_id_map.get(msg_id)
+        logger.info(f"[wa_ack] msg_id={msg_id}, ack={ack}, found={info is not None}")
         if info:
-            if ack == 2:
-                add_reaction(info["channel_id"], info["ts"], "mailbox_with_mail")
+            channel_id = info["channel_id"]
+            ts = info["ts"]
+            if ack == 1:
+                add_reaction(channel_id, ts, "white_check_mark")
+            elif ack == 2:
+                add_reaction(channel_id, ts, "mailbox_with_mail")
             elif ack == 3:
-                add_reaction(info["channel_id"], info["ts"], "eyes")
+                add_reaction(channel_id, ts, "eyes")
     except Exception as e:
         logger.error(f"[wa_ack] {e}")
 
@@ -283,24 +288,33 @@ def handle_slack_message(event, say):
         logger.info(f"[slack_msg] channel={channel_id}, "
             f"in_mapping={channel_id in channel_to_wa}, "
             f"text={text[:50]}")
-        # Get wa_number from mapping or channel name
+        # Get wa_number from mapping or channel name/topic
         if channel_id in channel_to_wa:
             ch_data = channel_to_wa[channel_id]
             wa_number = ch_data.get("wa_number") if isinstance(ch_data, dict) else ch_data
         else:
             try:
-                channel_name = slack_client.conversations_info(
-                    channel=channel_id)["channel"]["name"]
+                info = slack_client.conversations_info(channel=channel_id)
+                ch = info["channel"]
+                channel_name = ch.get("name", "")
+                topic = ch.get("topic", {}).get("value", "")
             except Exception as e:
                 logger.error(f"[slack_msg] conversations_info failed: {e}")
                 return
-            if not channel_name.startswith("waha-"):
+            # Try to get number from topic first
+            # Topic format: "WhatsApp chat with +14848910977 | ..."
+            topic_match = re.search(r"WhatsApp chat with \+(\d+)", topic)
+            if topic_match:
+                wa_number = topic_match.group(1)
+            elif channel_name.startswith("waha-"):
+                # fallback: extract digits from channel name
+                number = re.sub(r"[^\d]", "", channel_name[5:])
+                if not number or len(number) < 7:
+                    logger.info(f"[slack_msg] not a waha channel: {channel_name}")
+                    return
+                wa_number = number
+            else:
                 return
-            suffix = channel_name[5:]
-            number = re.sub(r"[^\d]", "", suffix)
-            if not number or len(number) < 7:
-                return
-            wa_number = number
             wa_to_channel[wa_number] = channel_id
             channel_to_wa[channel_id] = {
                 "wa_number": wa_number,
@@ -309,6 +323,7 @@ def handle_slack_message(event, say):
             save_store({"wa_to_channel": wa_to_channel,
                 "channel_to_wa": channel_to_wa,
                 "msg_id_map": msg_id_map})
+            logger.info(f"[slack_msg] auto-mapped {channel_id} → {wa_number}")
         try:
             slack_client.conversations_setTopic(
                 channel=channel_id,
