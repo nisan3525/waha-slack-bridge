@@ -272,7 +272,23 @@ def handle_slack_message(event, say):
             return
         channel_id = event.get("channel")
         if channel_id not in channel_to_wa:
-            return
+            try:
+                ch_name = slack_client.conversations_info(
+                    channel=channel_id)["channel"]["name"]
+            except Exception as e:
+                logger.error(f"[slack_msg] conversations_info error: {e}")
+                return
+            if not ch_name.startswith("waha-"):
+                return
+            suffix = ch_name[len("waha-"):]
+            digits = re.sub(r"[^\d]", "", suffix)
+            if not digits or len(digits) < 7:
+                return
+            wa_to_channel[digits] = channel_id
+            channel_to_wa[channel_id] = {"wa_number": digits, "contact_name": None}
+            save_store({"wa_to_channel": wa_to_channel,
+                "channel_to_wa": channel_to_wa,
+                "msg_id_map": msg_id_map})
         ch_data = channel_to_wa[channel_id]
         wa_number = ch_data.get("wa_number") if isinstance(ch_data, dict) else ch_data
         chat_id = to_chat_id(wa_number)
