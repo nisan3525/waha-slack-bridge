@@ -76,8 +76,28 @@ def waha_get_media(msg_id):
     return resp.content, resp.headers.get("Content-Type", "application/octet-stream")
 
 def send_waha_text(chat_id, text):
-    return waha_post("/api/sendText", {
-        "chatId": chat_id, "text": text, "session": WAHA_SESSION})
+    url = f"{WAHA_URL}/api/sendText"
+    body = {
+        "chatId": chat_id,
+        "text": text,
+        "session": WAHA_SESSION
+    }
+    logger.info(f"[send_waha_text] POST {url} → {body}")
+    try:
+        resp = requests.post(
+            url,
+            headers=waha_headers(),
+            json=body,
+            timeout=60
+        )
+        logger.info(f"[send_waha_text] status={resp.status_code}, "
+            f"response={resp.text[:200]}")
+        resp.raise_for_status()
+        return resp.json() if resp.content else {}
+    except Exception as e:
+        logger.error(f"[send_waha_text] FAILED: {e}, "
+            f"response={getattr(e, 'response', None) and e.response.text[:200]}")
+        raise
 
 def send_waha_media(chat_id, file_bytes, filename, mimetype, caption=None):
     b64 = base64.b64encode(file_bytes).decode()
