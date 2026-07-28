@@ -59,6 +59,33 @@ channel_to_wa = store["channel_to_wa"]
 msg_id_map = store.get("msg_id_map", {})
 logger.info(f"[startup] {len(wa_to_channel)} wa, {len(channel_to_wa)} channels")
 
+def extract_message_id(result):
+    """Extract msg_id from WAHA response, handling various formats."""
+    candidates = []
+    if isinstance(result, dict):
+        candidates.append(result.get("id"))
+        _data = result.get("_data")
+        if isinstance(_data, dict):
+            candidates.append(_data.get("id"))
+        message = result.get("message")
+        if isinstance(message, dict):
+            candidates.append(message.get("id"))
+        data = result.get("data")
+        if isinstance(data, dict):
+            candidates.append(data.get("id"))
+    for raw in candidates:
+        if not raw:
+            continue
+        if isinstance(raw, str):
+            return raw
+        if isinstance(raw, dict):
+            return (
+                raw.get("_serialized")
+                or raw.get("$1")
+                or raw.get("id")
+            )
+    return None
+
 def waha_headers():
     return {"X-Api-Key": WAHA_API_KEY, "Content-Type": "application/json"}
 
@@ -256,17 +283,19 @@ def _handle_wa_ack(payload):
         ack = payload.get("ack", 0)
         info = msg_id_map.get(msg_id)
         logger.info(f"[wa_ack] msg_id={msg_id}, ack={ack}, found={info is not None}")
-        if info:
-            channel_id = info["channel_id"]
-            ts = info["ts"]
-            if ack == 1:
-                add_reaction(channel_id, ts, "white_check_mark")
-            elif ack == 2:
-                add_reaction(channel_id, ts, "mailbox_with_mail")
-            elif ack == 3:
-                add_reaction(channel_id, ts, "eyes")
+        if not info:
+            return
+        channel_id = info["channel_id"]
+        ts = info["ts"]
+        if ack == 1:
+            add_reaction(channel_id, ts, "white_check_mark")
+        elif ack == 2:
+            add_reaction(channel_id, ts, "mailbox_with_mail")
+        elif ack == 3:
+            add_reaction(channel_id, ts, "eyes")
     except Exception as e:
         logger.error(f"[wa_ack] {e}")
+        logger.error(traceback.format_exc())
 
 @bolt_app.event("message")
 def handle_slack_message(event, say):
@@ -302,7 +331,7 @@ def handle_slack_message(event, say):
                 logger.error(f"[slack_msg] conversations_info failed: {e}")
                 return
             # Try to get number from topic first
-            # Topic format: "WhatsApp chat with +14848910977 | ..."
+            # Topic format: "WhatsApp chat with +14848910977 | ...\n"
             topic_match = re.search(r"WhatsApp chat with \+(\d+)", topic)
             if topic_match:
                 wa_number = topic_match.group(1)
@@ -350,19 +379,39 @@ def handle_slack_message(event, say):
             return
         if not text:
             return
+        
+        # Log outbound attempt
+        logger.info(f"[slack_msg] outbound attempt: channel_id={channel_id}, wa_number={wa_number}, chat_id={chat_id}, text={text[:100]}")
+        
+        # SEND - separate from bookkeeping
         try:
             result = send_waha_text(chat_id, text)
-            logger.info(f"[slack_msg] send result: {result}")
-            add_reaction(channel_id, event_ts, "white_check_mark")
-            msg_id = result.get("id", "")
-            if msg_id:
-                msg_id_map[msg_id] = {"channel_id": channel_id, "ts": event_ts}
-                save_store({"wa_to_channel": wa_to_channel,
-                    "channel_to_wa": channel_to_wa,
-                    "msg_id_map": msg_id_map})
         except Exception as e:
             logger.error(f"[slack_msg] send_waha_text FAILED: {e}")
+            logger.error(traceback.format_exc())
             add_reaction(channel_id, event_ts, "x")
+            return
+        
+        # BOOKKEEPING - after send succeeds, errors do not fail the send
+        logger.info(f"[slack_msg] send result: {result}")
+        try:
+            msg_id = extract_message_id(result)
+            logger.info(f"[slack_msg] extracted outbound msg_id={msg_id}")
+            if msg_id:
+                msg_id_map[msg_id] = {
+                    "channel_id": channel_id,
+                    "ts": event_ts
+                }
+                save_store({
+                    "wa_to_channel": wa_to_channel,
+                    "channel_to_wa": channel_to_wa,
+                    "msg_id_map": msg_id_map
+                })
+            else:
+                logger.warning(f"[slack_msg] no outbound msg_id found in response: {result}")
+        except Exception as e:
+            logger.error(f"[slack_msg] post-send bookkeeping failed: {e}")
+            logger.error(traceback.format_exc())
     except Exception as e:
         logger.error(f"[slack_msg] {e}\n{traceback.format_exc()}")
 
