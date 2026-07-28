@@ -6,6 +6,7 @@ import requests
 import threading
 import traceback
 import base64
+import json
 from flask import Flask, request, jsonify
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
@@ -57,7 +58,50 @@ store = load_store()
 wa_to_channel = store["wa_to_channel"]
 channel_to_wa = store["channel_to_wa"]
 msg_id_map = store.get("msg_id_map", {})
+
+# Migrate old saved mappings (non-dict values to dict)
+for cid, value in list(channel_to_wa.items()):
+    if not isinstance(value, dict):
+        channel_to_wa[cid] = {
+            "wa_number": value,
+            "contact_name": None,
+            "chat_id": None
+        }
+
+save_store({
+    "wa_to_channel": wa_to_channel,
+    "channel_to_wa": channel_to_wa,
+    "msg_id_map": msg_id_map
+})
+
 logger.info(f"[startup] {len(wa_to_channel)} wa, {len(channel_to_wa)} channels")
+
+def extract_message_id(result):
+    """Extract msg_id from WAHA response, handling various formats."""
+    candidates = []
+    if isinstance(result, dict):
+        candidates.append(result.get("id"))
+        _data = result.get("_data")
+        if isinstance(_data, dict):
+            candidates.append(_data.get("id"))
+        message = result.get("message")
+        if isinstance(message, dict):
+            candidates.append(message.get("id"))
+        data = result.get("data")
+        if isinstance(data, dict):
+            candidates.append(data.get("id"))
+    for raw in candidates:
+        if not raw:
+            continue
+        if isinstance(raw, str):
+            return raw
+        if isinstance(raw, dict):
+            return (
+                raw.get("_serialized")
+                or raw.get("$1")
+                or raw.get("id")
+            )
+    return None
 
 def waha_headers():
     return {"X-Api-Key": WAHA_API_KEY, "Content-Type": "application/json"}
@@ -76,8 +120,25 @@ def waha_get_media(msg_id):
     return resp.content, resp.headers.get("Content-Type", "application/octet-stream")
 
 def send_waha_text(chat_id, text):
-    return waha_post("/api/sendText", {
-        "chatId": chat_id, "text": text, "session": WAHA_SESSION})
+    url = f"{WAHA_URL}/api/sendText"
+    body = {
+        "chatId": chat_id,
+        "text": text,
+        "session": WAHA_SESSION
+    }
+    logger.info(f"[send_waha_text] POST {url} body={body}")
+    resp = requests.post(
+        url,
+        headers=waha_headers(),
+        json=body,
+        timeout=60
+    )
+    logger.info(
+        f"[send_waha_text] status={resp.status_code}, "
+        f"response={resp.text[:1000]}"
+    )
+    resp.raise_for_status()
+    return resp.json() if resp.content else {}
 
 def send_waha_media(chat_id, file_bytes, filename, mimetype, caption=None):
     b64 = base64.b64encode(file_bytes).decode()
@@ -150,7 +211,7 @@ def get_or_create_channel(wa_number, contact_name=None):
     except SlackApiError:
         pass
     wa_to_channel[wa_number] = ch_id
-    channel_to_wa[ch_id] = {"wa_number": wa_number, "contact_name": contact_name}
+    channel_to_wa[ch_id] = {"wa_number": wa_number, "contact_name": contact_name, "chat_id": None}
     save_store({"wa_to_channel": wa_to_channel,
         "channel_to_wa": channel_to_wa,
         "msg_id_map": msg_id_map})
@@ -184,32 +245,83 @@ def download_slack_file(file_id):
 
 @flask_app.route("/waha/webhook", methods=["POST"])
 def waha_webhook():
-    data = request.json or {}
-    event = data.get("event", "")
-    payload = data.get("payload", {})
-    logger.info(f"[waha_webhook] event={event}")
-    if event == "message":
-        threading.Thread(target=_handle_wa_message, args=(payload,), daemon=True).start()
-    elif event == "message.reaction":
-        threading.Thread(target=_handle_wa_reaction, args=(payload,), daemon=True).start()
-    elif event in ("message.ack", "message_ack", "ack"):
-        threading.Thread(target=_handle_wa_ack, args=(payload,), daemon=True).start()
-    return jsonify({"ok": True})
+    try:
+        data = request.json or {}
+        logger.info(f"[waha_webhook] received request, keys={list(data.keys())}")
+        logger.info(f"[waha_webhook] raw={json.dumps(data, default=str)[:500]}")
+        
+        event = data.get("event", "")
+        payload = data.get("payload", {})
+        
+        logger.info(f"[waha_webhook] event={event}, payload_type={type(payload).__name__}, payload_keys={list(payload.keys()) if isinstance(payload, dict) else 'N/A'}")
+        
+        # Handle message events with various naming conventions
+        if event in ("message", "message.any", "message.upsert", "message_added", "messages.upsert"):
+            logger.info(f"[waha_webhook] handling message event: {event}")
+            threading.Thread(target=_handle_wa_message, args=(payload,), daemon=True).start()
+        elif event in ("message.reaction", "message_reaction", "message.react"):
+            logger.info(f"[waha_webhook] handling reaction event: {event}")
+            threading.Thread(target=_handle_wa_reaction, args=(payload,), daemon=True).start()
+        elif event in ("message.ack", "message_ack", "ack", "message.status"):
+            logger.info(f"[waha_webhook] handling ack event: {event}")
+            threading.Thread(target=_handle_wa_ack, args=(payload,), daemon=True).start()
+        elif event in ("message.failed", "message_failed", "failed"):
+            logger.info(f"[waha_webhook] handling failed event: {event}")
+            threading.Thread(target=_handle_wa_failed, args=(payload,), daemon=True).start()
+        else:
+            logger.info(f"[waha_webhook] event not handled: {event}")
+        
+        return jsonify({"ok": True})
+    except Exception as e:
+        logger.error(f"[waha_webhook] error: {e}")
+        logger.error(traceback.format_exc())
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 def _handle_wa_message(payload):
     try:
-        if payload.get("fromMe", False):
+        logger.info(f"[wa_msg] payload={json.dumps(payload, default=str)[:500]}")
+        
+        # Check if payload is nested under "message" or "data"
+        if isinstance(payload, dict) and "message" in payload:
+            msg_data = payload["message"]
+            logger.info(f"[wa_msg] unwrapping from payload.message")
+        elif isinstance(payload, dict) and "data" in payload:
+            msg_data = payload["data"]
+            logger.info(f"[wa_msg] unwrapping from payload.data")
+        else:
+            msg_data = payload
+        
+        if msg_data.get("fromMe", False):
+            logger.info(f"[wa_msg] skipping outbound message")
             return
-        from_id = payload.get("from", "")
+        
+        from_id = msg_data.get("from", "")
         wa_number = from_chat_id(from_id)
-        contact_name = (payload.get("_data", {}).get("notifyName")
-            or payload.get("notifyName")
-            or payload.get("sender", {}).get("pushname") or None)
-        msg_id = payload.get("id", "")
-        body = payload.get("body", "")
-        has_media = payload.get("hasMedia", False)
-        msg_type = payload.get("type", "chat")
+        contact_name = (msg_data.get("_data", {}).get("notifyName")
+            or msg_data.get("notifyName")
+            or msg_data.get("sender", {}).get("pushname") or None)
+        msg_id = msg_data.get("id", "")
+        body = msg_data.get("body", "")
+        has_media = msg_data.get("hasMedia", False)
+        msg_type = msg_data.get("type", "chat")
+        
+        logger.info(f"[wa_msg] from_id={from_id}, wa_number={wa_number}, contact_name={contact_name}, body={body[:50]}, has_media={has_media}, msg_type={msg_type}")
+        
         channel_id = get_or_create_channel(wa_number, contact_name)
+        # Save the exact inbound chat_id from WAHA payload
+        wa_to_channel[wa_number] = channel_id
+        channel_to_wa[channel_id] = {
+            "wa_number": wa_number,
+            "contact_name": contact_name,
+            "chat_id": from_id
+        }
+        save_store({
+            "wa_to_channel": wa_to_channel,
+            "channel_to_wa": channel_to_wa,
+            "msg_id_map": msg_id_map
+        })
+        logger.info(f"[wa_msg] saved mapping channel={channel_id}, wa_number={wa_number}, chat_id={from_id}")
+        
         slack_ts = None
         if has_media:
             try:
@@ -223,12 +335,17 @@ def _handle_wa_message(payload):
                     channel=channel_id, file=media_bytes,
                     filename=filename, title=filename, initial_comment=comment)
                 slack_ts = resp.get("ts")
+                logger.info(f"[wa_msg] media uploaded, ts={slack_ts}")
             except Exception as e:
                 logger.error(f"[wa_msg] media error: {e}")
+                logger.error(traceback.format_exc())
+        
         msg_payload = format_incoming(contact_name, wa_number,
             f"[{msg_type}] {body or '(media)'}")
         slack_ts = slack_client.chat_postMessage(
             channel=channel_id, **msg_payload).get("ts")
+        logger.info(f"[wa_msg] message posted to slack, ts={slack_ts}, msg_id={msg_id}")
+        
         if msg_id and slack_ts:
             msg_id_map[msg_id] = {"channel_id": channel_id, "ts": slack_ts}
             save_store({"wa_to_channel": wa_to_channel,
@@ -239,6 +356,7 @@ def _handle_wa_message(payload):
 
 def _handle_wa_reaction(payload):
     try:
+        logger.info(f"[wa_reaction] payload={payload}")
         reaction = payload.get("reaction", {})
         emoji = reaction.get("text", "")
         msg_id = reaction.get("msgId", "")
@@ -256,17 +374,31 @@ def _handle_wa_ack(payload):
         ack = payload.get("ack", 0)
         info = msg_id_map.get(msg_id)
         logger.info(f"[wa_ack] msg_id={msg_id}, ack={ack}, found={info is not None}")
-        if info:
-            channel_id = info["channel_id"]
-            ts = info["ts"]
-            if ack == 1:
-                add_reaction(channel_id, ts, "white_check_mark")
-            elif ack == 2:
-                add_reaction(channel_id, ts, "mailbox_with_mail")
-            elif ack == 3:
-                add_reaction(channel_id, ts, "eyes")
+        if not info:
+            return
+        channel_id = info["channel_id"]
+        ts = info["ts"]
+        if ack == 1:
+            add_reaction(channel_id, ts, "white_check_mark")
+        elif ack == 2:
+            add_reaction(channel_id, ts, "mailbox_with_mail")
+        elif ack == 3:
+            add_reaction(channel_id, ts, "eyes")
     except Exception as e:
         logger.error(f"[wa_ack] {e}")
+        logger.error(traceback.format_exc())
+
+def _handle_wa_failed(payload):
+    try:
+        msg_id = payload.get("id", "")
+        info = msg_id_map.get(msg_id)
+        logger.info(f"[wa_failed] msg_id={msg_id}, found={info is not None}, payload={payload}")
+        if not info:
+            return
+        add_reaction(info["channel_id"], info["ts"], "x")
+    except Exception as e:
+        logger.error(f"[wa_failed] {e}")
+        logger.error(traceback.format_exc())
 
 @bolt_app.event("message")
 def handle_slack_message(event, say):
@@ -288,10 +420,16 @@ def handle_slack_message(event, say):
         logger.info(f"[slack_msg] channel={channel_id}, "
             f"in_mapping={channel_id in channel_to_wa}, "
             f"text={text[:50]}")
-        # Get wa_number from mapping or channel name/topic
+        # Get wa_number and chat_id from mapping or infer
+        chat_id = None
+        wa_number = None
         if channel_id in channel_to_wa:
             ch_data = channel_to_wa[channel_id]
-            wa_number = ch_data.get("wa_number") if isinstance(ch_data, dict) else ch_data
+            if isinstance(ch_data, dict):
+                wa_number = ch_data.get("wa_number")
+                chat_id = ch_data.get("chat_id")
+            else:
+                wa_number = ch_data
         else:
             try:
                 info = slack_client.conversations_info(channel=channel_id)
@@ -301,68 +439,98 @@ def handle_slack_message(event, say):
             except Exception as e:
                 logger.error(f"[slack_msg] conversations_info failed: {e}")
                 return
-            # Try to get number from topic first
-            # Topic format: "WhatsApp chat with +14848910977 | ..."
             topic_match = re.search(r"WhatsApp chat with \+(\d+)", topic)
             if topic_match:
                 wa_number = topic_match.group(1)
             elif channel_name.startswith("waha-"):
-                # fallback: extract digits from channel name
                 number = re.sub(r"[^\d]", "", channel_name[5:])
                 if not number or len(number) < 7:
-                    logger.info(f"[slack_msg] not a waha channel: {channel_name}")
                     return
                 wa_number = number
             else:
                 return
-            wa_to_channel[wa_number] = channel_id
             channel_to_wa[channel_id] = {
                 "wa_number": wa_number,
-                "contact_name": None
+                "contact_name": None,
+                "chat_id": None
             }
-            save_store({"wa_to_channel": wa_to_channel,
+            wa_to_channel[wa_number] = channel_id
+            save_store({
+                "wa_to_channel": wa_to_channel,
                 "channel_to_wa": channel_to_wa,
-                "msg_id_map": msg_id_map})
-            logger.info(f"[slack_msg] auto-mapped {channel_id} → {wa_number}")
-        try:
-            slack_client.conversations_setTopic(
-                channel=channel_id,
-                topic=f"WhatsApp chat with +{wa_number} | Reply here to send")
-        except Exception:
-            pass
+                "msg_id_map": msg_id_map
+            })
         if not wa_number:
-            logger.error("[slack_msg] wa_number is empty!")
+            logger.error("[slack_msg] wa_number is empty")
             return
-        chat_id = to_chat_id(wa_number)
-        logger.info(f"[slack_msg] sending to chat_id={chat_id}")
+        if not chat_id:
+            chat_id = to_chat_id(wa_number)
+        logger.info(f"[slack_msg] using wa_number={wa_number}, chat_id={chat_id}")
+        # Update topic if needed (not every send)
+        desired_topic = f"WhatsApp chat with +{wa_number} | Reply here to send"
+        try:
+            info = slack_client.conversations_info(channel=channel_id)
+            current_topic = info["channel"].get("topic", {}).get("value", "") or ""
+            if current_topic != desired_topic:
+                slack_client.conversations_setTopic(channel=channel_id, topic=desired_topic)
+                logger.info(f"[slack_msg] topic updated for {channel_id}")
+        except Exception as e:
+            logger.warning(f"[slack_msg] topic update failed: {e}")
         if files:
             for f in files:
                 if not isinstance(f, dict):
                     continue
                 try:
                     file_bytes, mimetype, filename = download_slack_file(f["id"])
-                    send_waha_media(chat_id, file_bytes, filename, mimetype,
+                    result = send_waha_media(chat_id, file_bytes, filename, mimetype,
                         caption=text or None)
-                    add_reaction(channel_id, event_ts, "white_check_mark")
+                    # Save msg_id for media files too
+                    msg_id = extract_message_id(result)
+                    if msg_id:
+                        msg_id_map[msg_id] = {"channel_id": channel_id, "ts": event_ts}
+                        save_store({"wa_to_channel": wa_to_channel,
+                            "channel_to_wa": channel_to_wa,
+                            "msg_id_map": msg_id_map})
                 except Exception as e:
                     logger.error(f"[slack_msg] file error: {e}")
                     add_reaction(channel_id, event_ts, "x")
             return
         if not text:
             return
+        # Log outbound attempt with full details
+        logger.info(
+            f"[slack_msg] outbound attempt: channel_id={channel_id}, "
+            f"wa_number={wa_number}, chat_id={chat_id}, text={text[:100]}"
+        )
+        # SEND: do not catch here - let exceptions propagate
         try:
             result = send_waha_text(chat_id, text)
-            logger.info(f"[slack_msg] send result: {result}")
-            add_reaction(channel_id, event_ts, "white_check_mark")
-            msg_id = result.get("id", "")
-            if msg_id:
-                msg_id_map[msg_id] = {"channel_id": channel_id, "ts": event_ts}
-                save_store({"wa_to_channel": wa_to_channel,
-                    "channel_to_wa": channel_to_wa,
-                    "msg_id_map": msg_id_map})
         except Exception as e:
             logger.error(f"[slack_msg] send_waha_text FAILED: {e}")
+            logger.error(traceback.format_exc())
             add_reaction(channel_id, event_ts, "x")
+            return
+        
+        # BOOKKEEPING: separate from send, do not fail the send if this fails
+        logger.info(f"[slack_msg] send result: {result}")
+        try:
+            msg_id = extract_message_id(result)
+            logger.info(f"[slack_msg] extracted outbound msg_id={msg_id}")
+            if msg_id:
+                msg_id_map[msg_id] = {
+                    "channel_id": channel_id,
+                    "ts": event_ts
+                }
+                save_store({
+                    "wa_to_channel": wa_to_channel,
+                    "channel_to_wa": channel_to_wa,
+                    "msg_id_map": msg_id_map
+                })
+            else:
+                logger.warning(f"[slack_msg] no outbound msg_id found in response: {result}")
+        except Exception as e:
+            logger.error(f"[slack_msg] post-send bookkeeping failed: {e}")
+            logger.error(traceback.format_exc())
     except Exception as e:
         logger.error(f"[slack_msg] {e}\n{traceback.format_exc()}")
 
@@ -376,8 +544,14 @@ def handle_reaction(event):
         if channel_id not in channel_to_wa:
             return
         ch_data = channel_to_wa[channel_id]
-        wa_number = ch_data.get("wa_number") if isinstance(ch_data, dict) else ch_data
-        chat_id = to_chat_id(wa_number)
+        if isinstance(ch_data, dict):
+            wa_number = ch_data.get("wa_number")
+            chat_id = ch_data.get("chat_id")
+        else:
+            wa_number = ch_data
+            chat_id = None
+        if not chat_id:
+            chat_id = to_chat_id(wa_number)
         emoji = EMOJI_MAP.get(reaction_name, f":{reaction_name}:")
         send_waha_text(chat_id, emoji)
     except Exception as e:
