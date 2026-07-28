@@ -85,6 +85,32 @@ def extract_message_id(result):
             )
     return None
 
+def build_chat_id(wa_number, chat_id=None):
+    """Build proper chat_id based on wa_number type.
+    
+    Args:
+        wa_number: The WhatsApp number/ID extracted from from_chat_id
+        chat_id: If provided, use this as the full chat_id (preserves inbound format)
+    
+    Returns:
+        Full chat_id with proper suffix (@c.us for phones, @lid for long IDs)
+    """
+    if chat_id:
+        return chat_id
+    wa_number = str(wa_number).strip()
+    # If it's already a full chat id, keep it
+    if wa_number.endswith("@c.us") or wa_number.endswith("@lid"):
+        return wa_number
+    # Heuristic:
+    # long numeric IDs (15+ digits) are likely LID identifiers, not phone numbers
+    digits = re.sub(r"[^\d]", "", wa_number)
+    if len(digits) >= 15:
+        logger.info(f"[build_chat_id] {wa_number} detected as long ID, using @lid suffix")
+        return f"{wa_number}@lid"
+    else:
+        logger.info(f"[build_chat_id] {wa_number} detected as phone number, using @c.us suffix")
+        return f"{wa_number}@c.us"
+
 def ensure_channel_topic(channel_id, wa_number):
     desired_topic = f"WhatsApp chat with +{wa_number} | Reply here to send"
     try:
@@ -137,6 +163,7 @@ def send_waha_media(chat_id, file_bytes, filename, mimetype, caption=None):
     return waha_post(ep, pl)
 
 def to_chat_id(number):
+    """Convert phone number to chat_id. DEPRECATED: use build_chat_id instead."""
     digits_only = re.sub(r'[^\d]', '', number)
     return f"{digits_only}@c.us"
 
@@ -389,7 +416,7 @@ def handle_slack_message(event, say):
             logger.error("[slack_msg] wa_number is empty")
             return
         if not chat_id:
-            chat_id = to_chat_id(wa_number)
+            chat_id = build_chat_id(wa_number)
         logger.info(
             f"[slack_msg] using wa_number={wa_number}, chat_id={chat_id}"
         )
@@ -453,8 +480,14 @@ def handle_reaction(event):
         if channel_id not in channel_to_wa:
             return
         ch_data = channel_to_wa[channel_id]
-        wa_number = ch_data.get("wa_number") if isinstance(ch_data, dict) else ch_data
-        chat_id = to_chat_id(wa_number)
+        if isinstance(ch_data, dict):
+            wa_number = ch_data.get("wa_number")
+            chat_id = ch_data.get("chat_id")
+        else:
+            wa_number = ch_data
+            chat_id = None
+        if not chat_id:
+            chat_id = build_chat_id(wa_number)
         emoji = EMOJI_MAP.get(reaction_name, f":{reaction_name}:")
         send_waha_text(chat_id, emoji)
     except Exception as e:
