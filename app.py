@@ -76,8 +76,25 @@ def waha_get_media(msg_id):
     return resp.content, resp.headers.get("Content-Type", "application/octet-stream")
 
 def send_waha_text(chat_id, text):
-    return waha_post("/api/sendText", {
-        "chatId": chat_id, "text": text, "session": WAHA_SESSION})
+    url = f"{WAHA_URL}/api/sendText"
+    body = {
+        "chatId": chat_id,
+        "text": text,
+        "session": WAHA_SESSION
+    }
+    logger.info(f"[send_waha_text] POST {url} body={body}")
+    resp = requests.post(
+        url,
+        headers=waha_headers(),
+        json=body,
+        timeout=60
+    )
+    logger.info(
+        f"[send_waha_text] status={resp.status_code}, "
+        f"response={resp.text[:1000]}"
+    )
+    resp.raise_for_status()
+    return resp.json() if resp.content else {}
 
 def send_waha_media(chat_id, file_bytes, filename, mimetype, caption=None):
     b64 = base64.b64encode(file_bytes).decode()
@@ -118,6 +135,26 @@ def invite_auto_join(channel_id):
     except Exception as e:
         logger.warning(f"[invite] {e}")
 
+def set_channel_topic_if_needed(channel_id, wa_number):
+    """Only set topic if it's empty or incorrect"""
+    try:
+        info = slack_client.conversations_info(channel=channel_id)
+        ch = info["channel"]
+        current_topic = ch.get("topic", {}).get("value", "") or ""
+    except Exception:
+        current_topic = ""
+    
+    desired_topic = f"WhatsApp chat with +{wa_number} | Reply here to send"
+    if current_topic != desired_topic:
+        try:
+            slack_client.conversations_setTopic(
+                channel=channel_id,
+                topic=desired_topic
+            )
+            logger.info(f"[slack_msg] topic updated for {channel_id} -> {desired_topic}")
+        except Exception as e:
+            logger.warning(f"[slack_msg] topic update failed: {e}")
+
 def get_or_create_channel(wa_number, contact_name=None):
     if wa_number in wa_to_channel:
         return wa_to_channel[wa_number]
@@ -143,12 +180,7 @@ def get_or_create_channel(wa_number, contact_name=None):
     except SlackApiError:
         pass
     invite_auto_join(ch_id)
-    try:
-        slack_client.conversations_setTopic(
-            channel=ch_id,
-            topic=f"WhatsApp chat with +{wa_number} | Reply here to send")
-    except SlackApiError:
-        pass
+    set_channel_topic_if_needed(ch_id, wa_number)
     wa_to_channel[wa_number] = ch_id
     channel_to_wa[ch_id] = {"wa_number": wa_number, "contact_name": contact_name}
     save_store({"wa_to_channel": wa_to_channel,
@@ -210,6 +242,17 @@ def _handle_wa_message(payload):
         has_media = payload.get("hasMedia", False)
         msg_type = payload.get("type", "chat")
         channel_id = get_or_create_channel(wa_number, contact_name)
+        # Always refresh and save mapping for inbound-created channels
+        wa_to_channel[wa_number] = channel_id
+        channel_to_wa[channel_id] = {
+            "wa_number": wa_number,
+            "contact_name": contact_name
+        }
+        save_store({
+            "wa_to_channel": wa_to_channel,
+            "channel_to_wa": channel_to_wa,
+            "msg_id_map": msg_id_map
+        })
         slack_ts = None
         if has_media:
             try:
@@ -288,11 +331,14 @@ def handle_slack_message(event, say):
         logger.info(f"[slack_msg] channel={channel_id}, "
             f"in_mapping={channel_id in channel_to_wa}, "
             f"text={text[:50]}")
-        # Get wa_number from mapping or channel name/topic
+        # Priority: mapping > topic > channel name
         if channel_id in channel_to_wa:
+            # Use existing mapping directly
             ch_data = channel_to_wa[channel_id]
             wa_number = ch_data.get("wa_number") if isinstance(ch_data, dict) else ch_data
+            logger.info(f"[slack_msg] using existing mapping: {channel_id} -> {wa_number}")
         else:
+            # Try to infer from topic or channel name
             try:
                 info = slack_client.conversations_info(channel=channel_id)
                 ch = info["channel"]
@@ -306,6 +352,7 @@ def handle_slack_message(event, say):
             topic_match = re.search(r"WhatsApp chat with \+(\d+)", topic)
             if topic_match:
                 wa_number = topic_match.group(1)
+                logger.info(f"[slack_msg] extracted from topic: {wa_number}")
             elif channel_name.startswith("waha-"):
                 # fallback: extract digits from channel name
                 number = re.sub(r"[^\d]", "", channel_name[5:])
@@ -313,28 +360,27 @@ def handle_slack_message(event, say):
                     logger.info(f"[slack_msg] not a waha channel: {channel_name}")
                     return
                 wa_number = number
+                logger.info(f"[slack_msg] extracted from name: {wa_number}")
             else:
+                logger.info(f"[slack_msg] channel not a waha channel: {channel_name}")
                 return
             wa_to_channel[wa_number] = channel_id
             channel_to_wa[channel_id] = {
                 "wa_number": wa_number,
                 "contact_name": None
             }
-            save_store({"wa_to_channel": wa_to_channel,
+            save_store({
+                "wa_to_channel": wa_to_channel,
                 "channel_to_wa": channel_to_wa,
-                "msg_id_map": msg_id_map})
+                "msg_id_map": msg_id_map
+            })
             logger.info(f"[slack_msg] auto-mapped {channel_id} → {wa_number}")
-        try:
-            slack_client.conversations_setTopic(
-                channel=channel_id,
-                topic=f"WhatsApp chat with +{wa_number} | Reply here to send")
-        except Exception:
-            pass
+        # Only set topic if needed (not every message)
+        set_channel_topic_if_needed(channel_id, wa_number)
         if not wa_number:
             logger.error("[slack_msg] wa_number is empty!")
             return
         chat_id = to_chat_id(wa_number)
-        logger.info(f"[slack_msg] sending to chat_id={chat_id}")
         if files:
             for f in files:
                 if not isinstance(f, dict):
@@ -350,6 +396,11 @@ def handle_slack_message(event, say):
             return
         if not text:
             return
+        # Log outbound attempt with full details
+        logger.info(
+            f"[slack_msg] outbound attempt: channel_id={channel_id}, "
+            f"wa_number={wa_number}, chat_id={chat_id}, text={text[:100]}"
+        )
         try:
             result = send_waha_text(chat_id, text)
             logger.info(f"[slack_msg] send result: {result}")
@@ -362,7 +413,9 @@ def handle_slack_message(event, say):
                     "msg_id_map": msg_id_map})
         except Exception as e:
             logger.error(f"[slack_msg] send_waha_text FAILED: {e}")
+            logger.error(traceback.format_exc())
             add_reaction(channel_id, event_ts, "x")
+            return
     except Exception as e:
         logger.error(f"[slack_msg] {e}\n{traceback.format_exc()}")
 
