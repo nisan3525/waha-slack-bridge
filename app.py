@@ -129,37 +129,29 @@ def waha_post(endpoint, payload):
     resp.raise_for_status()
     return resp.json() if resp.content else {}
 
-def waha_get_media(msg_id):
-    """Try multiple endpoints to download media from WAHA"""
-    endpoints = [
-        f"/api/{WAHA_SESSION}/messages/{msg_id}/download",
-        f"/api/{WAHA_SESSION}/messages/{msg_id}/download-media",
-        f"/api/files/{msg_id}",
-        f"/api/files/download?msgId={msg_id}&session={WAHA_SESSION}",
-    ]
-    last_error = None
-    for ep in endpoints:
-        try:
-            url = f"{WAHA_URL}{ep}"
-            resp = requests.get(
-                url,
-                headers={"X-Api-Key": WAHA_API_KEY},
-                timeout=120
+def waha_get_media_from_url(media_url):
+    """Download media using the direct URL from payload.media.url"""
+    try:
+        logger.info(f"[media] GET {media_url}")
+        resp = requests.get(
+            media_url,
+            headers={"X-Api-Key": WAHA_API_KEY},
+            timeout=120
+        )
+        logger.info(
+            f"[media] GET -> status={resp.status_code}, "
+            f"content_type={resp.headers.get('Content-Type')}, "
+            f"size={len(resp.content) if resp.content else 0}"
+        )
+        if resp.status_code == 200 and resp.content:
+            return resp.content, resp.headers.get(
+                "Content-Type", "application/octet-stream"
             )
-            logger.info(
-                f"[media] GET {url} -> status={resp.status_code}, "
-                f"content_type={resp.headers.get('Content-Type')}, "
-                f"size={len(resp.content) if resp.content else 0}"
-            )
-            if resp.status_code == 200 and resp.content and len(resp.content) > 50:
-                return resp.content, resp.headers.get(
-                    "Content-Type", "application/octet-stream"
-                )
-        except Exception as e:
-            last_error = e
-            logger.error(f"[media] endpoint failed {ep}: {e}")
-            logger.error(traceback.format_exc())
-    raise Exception(f"All media endpoints failed for msg_id={msg_id}. Last error={last_error}")
+        else:
+            raise Exception(f"HTTP {resp.status_code}: {resp.text[:200]}")
+    except Exception as e:
+        logger.error(f"[media] download failed: {e}")
+        raise
 
 def send_waha_text(chat_id, text):
     return waha_post("/api/sendText", {
@@ -296,9 +288,10 @@ def _handle_wa_message(payload):
         body = payload.get("body", "")
         has_media = payload.get("hasMedia", False)
         msg_type = payload.get("type", "chat")
+        media = payload.get("media", {}) or {}
         
         logger.info(
-            f"[wa_msg] media fields: media={payload.get('media')}, "
+            f"[wa_msg] media fields: media={media}, "
             f"_data_keys={list(payload.get('_data', {}).keys()) if isinstance(payload.get('_data'), dict) else None}"
         )
         logger.info(
@@ -320,9 +313,11 @@ def _handle_wa_message(payload):
         })
         logger.info(f"[wa_msg] saved mapping channel={channel_id}, wa_number={wa_number}, chat_id={from_id}")
         slack_ts = None
-        if has_media:
+        if has_media and media.get("url"):
             try:
-                media_bytes, ct = waha_get_media(msg_id)
+                media_url = media.get("url")
+                logger.info(f"[media] downloading from {media_url}")
+                media_bytes, ct = waha_get_media_from_url(media_url)
                 ext = "bin"
                 if ct and "/" in ct:
                     ext = ct.split("/")[-1].split(";")[0]
