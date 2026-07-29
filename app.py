@@ -344,44 +344,6 @@ def _handle_wa_ack(payload):
         logger.error(f"[wa_ack] {e}")
         logger.error(traceback.format_exc())
 
-@bolt_app.event("member_joined_channel")
-def handle_member_joined(event):
-    """Auto-set channel topic when bot joins a waha-* channel"""
-    try:
-        channel_id = event.get("channel")
-        user_id = event.get("user")
-        if user_id != BOT_USER_ID:
-            return
-        # Get channel info
-        info = slack_client.conversations_info(channel=channel_id)
-        channel_name = info["channel"].get("name", "")
-        if not channel_name.startswith("waha-"):
-            return
-        # Extract wa_number from channel name
-        wa_number = re.sub(r"[^\d]", "", channel_name[5:])
-        if not wa_number or len(wa_number) < 7:
-            logger.info(f"[member_joined] not a valid waha channel: {channel_name}")
-            return
-        logger.info(f"[member_joined] bot joined {channel_name}, setting topic for wa_number={wa_number}")
-        ensure_channel_topic(channel_id, wa_number)
-        # Also create mapping entry
-        if channel_id not in channel_to_wa:
-            channel_to_wa[channel_id] = {
-                "wa_number": wa_number,
-                "contact_name": None,
-                "chat_id": None,
-            }
-            wa_to_channel[wa_number] = channel_id
-            save_store({
-                "wa_to_channel": wa_to_channel,
-                "channel_to_wa": channel_to_wa,
-                "msg_id_map": msg_id_map,
-            })
-            logger.info(f"[member_joined] auto-mapped {channel_id} -> {wa_number}")
-    except Exception as e:
-        logger.error(f"[member_joined] {e}")
-        logger.error(traceback.format_exc())
-
 @bolt_app.event("message")
 def handle_slack_message(event, say):
     try:
