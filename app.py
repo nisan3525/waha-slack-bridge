@@ -130,11 +130,36 @@ def waha_post(endpoint, payload):
     return resp.json() if resp.content else {}
 
 def waha_get_media(msg_id):
-    resp = requests.get(
-        f"{WAHA_URL}/api/{WAHA_SESSION}/messages/{msg_id}/download-media",
-        headers={"X-Api-Key": WAHA_API_KEY}, timeout=60)
-    resp.raise_for_status()
-    return resp.content, resp.headers.get("Content-Type", "application/octet-stream")
+    """Try multiple endpoints to download media from WAHA"""
+    endpoints = [
+        f"/api/{WAHA_SESSION}/messages/{msg_id}/download",
+        f"/api/{WAHA_SESSION}/messages/{msg_id}/download-media",
+        f"/api/files/{msg_id}",
+        f"/api/files/download?msgId={msg_id}&session={WAHA_SESSION}",
+    ]
+    last_error = None
+    for ep in endpoints:
+        try:
+            url = f"{WAHA_URL}{ep}"
+            resp = requests.get(
+                url,
+                headers={"X-Api-Key": WAHA_API_KEY},
+                timeout=120
+            )
+            logger.info(
+                f"[media] GET {url} -> status={resp.status_code}, "
+                f"content_type={resp.headers.get('Content-Type')}, "
+                f"size={len(resp.content) if resp.content else 0}"
+            )
+            if resp.status_code == 200 and resp.content and len(resp.content) > 50:
+                return resp.content, resp.headers.get(
+                    "Content-Type", "application/octet-stream"
+                )
+        except Exception as e:
+            last_error = e
+            logger.error(f"[media] endpoint failed {ep}: {e}")
+            logger.error(traceback.format_exc())
+    raise Exception(f"All media endpoints failed for msg_id={msg_id}. Last error={last_error}")
 
 def send_waha_text(chat_id, text):
     return waha_post("/api/sendText", {
@@ -271,6 +296,16 @@ def _handle_wa_message(payload):
         body = payload.get("body", "")
         has_media = payload.get("hasMedia", False)
         msg_type = payload.get("type", "chat")
+        
+        logger.info(
+            f"[wa_msg] media fields: media={payload.get('media')}, "
+            f"_data_keys={list(payload.get('_data', {}).keys()) if isinstance(payload.get('_data'), dict) else None}"
+        )
+        logger.info(
+            f"[wa_msg] media inbound: msg_id={msg_id}, type={msg_type}, "
+            f"has_media={has_media}, body={body[:100] if body else ''}"
+        )
+        
         channel_id = get_or_create_channel(wa_number, contact_name)
         wa_to_channel[wa_number] = channel_id
         channel_to_wa[channel_id] = {
@@ -288,21 +323,46 @@ def _handle_wa_message(payload):
         if has_media:
             try:
                 media_bytes, ct = waha_get_media(msg_id)
-                ext = ct.split("/")[-1].split(";")[0]
-                filename = "voice_note.m4a" if msg_type in ("audio","ptt") else f"{msg_type}.{ext}"
+                ext = "bin"
+                if ct and "/" in ct:
+                    ext = ct.split("/")[-1].split(";")[0]
+                if msg_type in ("audio", "ptt", "voice"):
+                    filename = "voice_note.ogg"
+                elif msg_type == "image":
+                    filename = f"image.{ext}"
+                elif msg_type == "video":
+                    filename = f"video.{ext}"
+                elif msg_type == "document":
+                    filename = f"document.{ext}"
+                else:
+                    filename = f"{msg_type}.{ext}"
                 comment = f"{contact_name} (+{wa_number})" if contact_name else f"+{wa_number}"
                 if body:
                     comment += f" — {body}"
                 resp = slack_client.files_upload_v2(
-                    channel=channel_id, file=media_bytes,
-                    filename=filename, title=filename, initial_comment=comment)
+                    channel=channel_id,
+                    file=media_bytes,
+                    filename=filename,
+                    title=filename,
+                    initial_comment=comment
+                )
                 slack_ts = resp.get("ts")
+                logger.info(f"[wa_msg] media uploaded to Slack: filename={filename}, ts={slack_ts}")
             except Exception as e:
-                logger.error(f"[wa_msg] media error: {e}")
-        msg_payload = format_incoming(contact_name, wa_number,
-            f"[{msg_type}] {body or '(media)'}")
-        slack_ts = slack_client.chat_postMessage(
-            channel=channel_id, **msg_payload).get("ts")
+                logger.error(f"[wa_msg] media download/upload failed: {e}")
+                logger.error(traceback.format_exc())
+                display_text = body if body else f"📎 [{msg_type}] media received but download failed"
+                msg_payload = format_incoming(contact_name, wa_number, display_text)
+                slack_ts = slack_client.chat_postMessage(
+                    channel=channel_id,
+                    **msg_payload
+                ).get("ts")
+        else:
+            msg_payload = format_incoming(contact_name, wa_number,
+                f"[{msg_type}] {body or '(media)'}")
+            slack_ts = slack_client.chat_postMessage(
+                channel=channel_id, **msg_payload).get("ts")
+        
         if msg_id and slack_ts:
             msg_id_map[msg_id] = {"channel_id": channel_id, "ts": slack_ts}
             save_store({"wa_to_channel": wa_to_channel,
