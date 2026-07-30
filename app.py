@@ -399,16 +399,25 @@ def _handle_wa_ack(payload):
         elif ack < 0:
             add_reaction(channel_id, ts, "x")
             logger.warning(f"[wa_ack] negative ack received for {msg_id}: {ack}")
-            ack_name = payload.get("ackName")
-            if ack_name:
-                try:
-                    slack_client.chat_postMessage(
-                        channel=channel_id,
-                        thread_ts=ts,
-                        text=f"WhatsApp send failed: ack={ack} ({ack_name})"
+            try:
+                ack_name = payload.get("ackName")
+                is_send_failure = payload.get("_data", {}).get("isSendFailure") if isinstance(payload.get("_data"), dict) else None
+                to = payload.get("to")
+                body = payload.get("body")
+                slack_client.chat_postMessage(
+                    channel=channel_id,
+                    thread_ts=ts,
+                    text=(
+                        f"WhatsApp send failed\n"
+                        f"• ack: {ack}\n"
+                        f"• ackName: {ack_name}\n"
+                        f"• isSendFailure: {is_send_failure}\n"
+                        f"• to: {to}\n"
+                        f"• body: {body}"
                     )
-                except Exception as e:
-                    logger.error(f"[wa_ack] failed to post thread error: {e}")
+                )
+            except Exception as e:
+                logger.error(f"[wa_ack] failed to post failure details: {e}")
     except Exception as e:
         logger.error(f"[wa_ack] {e}")
         logger.error(traceback.format_exc())
